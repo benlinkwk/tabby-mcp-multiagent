@@ -183,6 +183,11 @@ export class ExecCommandTool extends BaseTool {
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
+      // Cancelled while reconnecting or confirming: don't run it at all
+      if (signal?.aborted || connectionClosed?.aborted) {
+        return createErrorResponse('Cancelled before the command was sent; nothing ran.');
+      }
+
       // Generate unique markers for this command. Keep the marker protocol
       // shell-agnostic: print a start marker, run the command, then print the
       // end marker with the exit code on the same line.
@@ -414,25 +419,19 @@ printf '\\n${marker} %s\\n' "$?"
     const cleanTextAfter = stripAnsi(textAfter);
     const lines = cleanTextAfter.split('\n');
 
-    // Find start marker
-    let startIndex = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].includes(startMarker)) {
-        startIndex = i;
-        break;
-      }
-    }
+    // Start after the marker the command printed, not the shell's echo of the
+    // command lines (same as a finished command)
+    const startIndex = lines.findIndex((line: string) => line.trim() === startMarker);
 
     let output = '';
     if (startIndex !== -1) {
-      // Get everything from start marker to end
       output = lines.slice(startIndex + 1)
         .filter((line: string) => !line.includes(startMarker))
         .join('\n')
         .trim();
     } else {
-      // If no start marker found, return whole buffer
-      output = cleanTextAfter;
+      // Not started yet: return nothing rather than earlier commands' output
+      note = [note, 'The command had not started printing yet, so there is no output.'].filter(Boolean).join(' ');
     }
 
     // Store the output in the storage service
