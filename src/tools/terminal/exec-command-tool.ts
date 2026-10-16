@@ -11,6 +11,20 @@ import { DialogService } from '../../services/dialog.service';
 import { RunningCommandsManagerService } from '../../services/runningCommandsManager.service';
 
 /**
+ * Per-call context from the MCP request
+ */
+interface ExecContext {
+  // Request cancelled by the client (e.g. the user pressed Esc)
+  signal?: AbortSignal;
+  // The client's SSE connection closed
+  connectionClosed?: AbortSignal;
+  // MCP session id of the client
+  clientId?: string;
+  // Interrupt the command after this long
+  timeoutMs?: number;
+}
+
+/**
  * Tool for executing a command in a terminal session and retrieving the output.
  *
  * This tool allows executing shell commands in terminal sessions and handles
@@ -27,6 +41,10 @@ export class ExecCommandTool extends BaseTool {
   private readonly MAX_RETRY_ATTEMPTS = 3;
   // How long to wait for a disconnected tab to reconnect
   private readonly RECONNECT_TIMEOUT_MS = 30000;
+  // How long to wait for another client's command on the same tab
+  private readonly TAB_WAIT_MS = 30000;
+  // Default time before a command is interrupted
+  private readonly DEFAULT_TIMEOUT_SEC = 600;
 
   constructor(
     private execToolCategory: ExecToolCategory,
@@ -56,9 +74,9 @@ export class ExecCommandTool extends BaseTool {
     session: any,
     commandExplanation?: string,
     retryAttempt: number = 1,
-    signal?: AbortSignal,
-    connectionClosed?: AbortSignal
+    ctx: ExecContext = {}
   ): Promise<any> {
+    const { signal, connectionClosed } = ctx;
     try {
       this.logger.info(`Executing command (attempt ${retryAttempt}/${this.MAX_RETRY_ATTEMPTS}): ${command}`);
 
@@ -66,15 +84,6 @@ export class ExecCommandTool extends BaseTool {
       const pairProgrammingEnabled = this.config.store.mcp?.pairProgrammingMode?.enabled === true;
       const showConfirmationDialog = pairProgrammingEnabled && this.config.store.mcp?.pairProgrammingMode?.showConfirmationDialog !== false;
       const autoFocusTerminal = pairProgrammingEnabled && this.config.store.mcp?.pairProgrammingMode?.autoFocusTerminal !== false;
-
-      // Check if a command is already running in this session and auto-abort it
-      const currentActiveCommand = this.execToolCategory.getActiveCommand(session.id);
-      if (currentActiveCommand) {
-        this.logger.info(`Auto-aborting currently running command in session ${session.id}: ${currentActiveCommand.command}`);
-        this.execToolCategory.abortCommand(session.id);
-        // Wait a bit for the abort to take effect
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
 
       // Show confirmation dialog if enabled (only on first attempt)
       if (showConfirmationDialog && retryAttempt === 1) {
@@ -201,7 +210,8 @@ export class ExecCommandTool extends BaseTool {
         timestamp,
         startMarker,
         endMarker,
-        abort: abortHandler
+        abort: abortHandler,
+        clientId: ctx.clientId
       });
 
       // Start tracking the command in running commands manager
@@ -213,11 +223,12 @@ export class ExecCommandTool extends BaseTool {
       const trimmedCommand = command.endsWith('\n') ? command.slice(0, -1) : command;
       // Keep the protocol simple, matching tmux-mcp: run a subshell and print
       // a single end marker with `$?`. No shell hooks, prompt hooks, temp
-      // scripts, or cleanup variables.
+      // scripts, or cleanup variables. The end marker starts with a newline so
+      // it gets its own line when the output does not end with one.
       const wrappedCommand = `(
 printf '${marker}\\n'
 ${trimmedCommand}
-printf '${marker} %s\\n' "$?"
+printf '\\n${marker} %s\\n' "$?"
 )\n`;
 
       session.tab.sendInput(wrappedCommand);
@@ -228,9 +239,18 @@ printf '${marker} %s\\n' "$?"
       let commandFinished = false;
       let sessionClosed = false;
       let clientGone = false;
+      let timedOut = false;
+      const deadline = executionStartTime + (ctx.timeoutMs ?? this.DEFAULT_TIMEOUT_SEC * 1000);
 
       while (!commandFinished && !aborted) {
         await new Promise(resolve => setTimeout(resolve, 100)); // Poll every 100ms
+
+        // Never wait forever, e.g. for a command waiting on input
+        if (Date.now() > deadline) {
+          timedOut = true;
+          this.execToolCategory.abortCommand(session.id);
+          break;
+        }
 
         // The MCP client disconnected. Stop waiting but leave the command
         // running in the terminal; nobody asked to stop it.
@@ -314,7 +334,10 @@ printf '${marker} %s\\n' "$?"
       }
 
       if (aborted) {
-        return this.handleAbortedCommand(command, session, startMarker, executionStartTime, pairProgrammingEnabled);
+        const note = timedOut
+          ? `Timed out after ${Math.round((Date.now() - executionStartTime) / 1000)}s and was interrupted with Ctrl+C. Rerun with a larger timeout if it needs longer.`
+          : undefined;
+        return this.handleAbortedCommand(command, session, startMarker, executionStartTime, pairProgrammingEnabled, note);
       }
 
       if (clientGone) {
@@ -340,7 +363,7 @@ printf '${marker} %s\\n' "$?"
           await new Promise(resolve => setTimeout(resolve, 1000));
           
           // Recursive retry
-          return this.executeCommandWithRetry(command, session, commandExplanation, retryAttempt + 1, signal, connectionClosed);
+          return this.executeCommandWithRetry(command, session, commandExplanation, retryAttempt + 1, ctx);
         } else {
           throw new Error(`Command execution failed after ${this.MAX_RETRY_ATTEMPTS} attempts`);
         }
@@ -362,7 +385,7 @@ printf '${marker} %s\\n' "$?"
         await new Promise(resolve => setTimeout(resolve, 1000));
         
         // Recursive retry
-        return this.executeCommandWithRetry(command, session, commandExplanation, retryAttempt + 1, signal, connectionClosed);
+        return this.executeCommandWithRetry(command, session, commandExplanation, retryAttempt + 1, ctx);
       } else {
         this.logger.error(`Command execution failed after ${this.MAX_RETRY_ATTEMPTS} attempts:`, error);
         throw error;
@@ -382,7 +405,8 @@ printf '${marker} %s\\n' "$?"
     session: any,
     startMarker: string,
     executionStartTime: number,
-    pairProgrammingEnabled: boolean
+    pairProgrammingEnabled: boolean,
+    note?: string
   ): Promise<any> {
     this.logger.info(`Command was aborted, retrieving partial output`);
 
@@ -492,9 +516,12 @@ printf '${marker} %s\\n' "$?"
       exitCode: null,
       aborted: true,
       outputId,
-      message: outputLines.length > this.MAX_LINES_PER_RESPONSE
-        ? `Output is too long (${outputLines.length} lines). Full output stored with ID: ${outputId}. Use get_command_output tool with this ID to retrieve the full output.`
-        : '',
+      message: [
+        note,
+        outputLines.length > this.MAX_LINES_PER_RESPONSE
+          ? `Output is too long (${outputLines.length} lines). Full output stored with ID: ${outputId}. Use get_command_output tool with this ID to retrieve the full output.`
+          : '',
+      ].filter(Boolean).join(' '),
     });
   }
 
@@ -609,7 +636,8 @@ USE CASES:
 - Perform file operations
 
 LIMITATIONS:
-- Only one command can run at a time
+- One command per tab; a command from another client waits up to 30s, then returns a busy error
+- Interrupted with Ctrl+C after \`timeout\` seconds (default 600)
 - Commands with very long output (>250 lines) will be truncated
 - Some interactive commands may not work as expected
 - Automatic retry up to 3 times on execution failures
@@ -642,7 +670,9 @@ POSSIBLE ERRORS:
 
         commandExplanation: z.string().optional().describe('Explanation of what the command does, used for user confirmation in pair programming mode. Include: 1) What the base command does (e.g., "ls" lists directory contents), 2) What each argument/flag does (e.g., "-r" reverses order), 3) The overall purpose of the command. Example: "The command \'ls -la\' lists all files including hidden ones in long format showing permissions and sizes."'),
 
-        tabId: z.string().optional().describe('The ID of the terminal tab where the command will be executed. If not provided, the currently focused terminal will be used. Get available IDs by calling get_ssh_session_list first. Example: "0" or "1".')
+        tabId: z.string().optional().describe('The ID of the terminal tab where the command will be executed. If not provided, the currently focused terminal will be used. Get available IDs by calling get_ssh_session_list first. Example: "0" or "1".'),
+
+        timeout: z.number().int().min(1).optional().describe('Seconds before the command is interrupted with Ctrl+C (default 600)')
       },
       handler: async (params, extra) => {
         let session; // Declare session at outer scope for catch/finally access
@@ -678,8 +708,39 @@ POSSIBLE ERRORS:
 
           this.logger.info(`Using terminal session ${session.id} (${session.tab.title})`);
 
-          // Execute command with retry logic
-          return await this.executeCommandWithRetry(command, session, commandExplanation, 1, extra?.signal, extra?.connectionClosed);
+          const ctx: ExecContext = {
+            signal: extra?.signal,
+            connectionClosed: extra?.connectionClosed,
+            clientId: extra?.sessionId,
+            timeoutMs: params.timeout ? params.timeout * 1000 : undefined,
+          };
+
+          // A new command from the same client replaces its previous one
+          // (e.g. one it gave up on); another client's command is never aborted.
+          const running = this.execToolCategory.getActiveCommand(session.id);
+          if (running && running.clientId === ctx.clientId) {
+            this.logger.info(`Auto-aborting previous command in session ${session.id}: ${running.command}`);
+            this.execToolCategory.abortCommand(session.id);
+          }
+
+          // One command per tab: wait for another client's command to finish
+          const release = await this.execToolCategory.acquireTab(session, this.TAB_WAIT_MS, [ctx.signal, ctx.connectionClosed]);
+          if (!release) {
+            if (ctx.signal?.aborted || ctx.connectionClosed?.aborted) {
+              return createErrorResponse('Cancelled while waiting for the tab');
+            }
+            const busy = this.execToolCategory.getActiveCommand(session.id);
+            const detail = busy
+              ? ` running "${busy.command.slice(0, 80)}" for ${Math.round((Date.now() - busy.timestamp) / 1000)}s`
+              : '';
+            return createErrorResponse(`Tab ${session.id} (${session.tab.title}) is busy${detail} for another client. Retry later or use another tab.`);
+          }
+
+          try {
+            return await this.executeCommandWithRetry(command, session, commandExplanation, 1, ctx);
+          } finally {
+            release();
+          }
 
         } catch (err) {
           this.logger.error(`Error executing command:`, err);

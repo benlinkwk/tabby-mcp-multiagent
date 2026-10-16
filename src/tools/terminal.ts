@@ -37,6 +37,31 @@ export interface ActiveCommand {
   startMarker: string;
   endMarker: string;
   abort: () => void;
+  // MCP session that started the command
+  clientId?: string;
+}
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Resolve true when `promise` settles, false on timeout or when any signal aborts.
+ */
+function waitFor(promise: Promise<unknown>, ms: number, signals: (AbortSignal | undefined)[]): Promise<boolean> {
+  return new Promise(resolve => {
+    const done = (ok: boolean) => {
+      clearTimeout(timer);
+      signals.forEach(s => s?.removeEventListener('abort', onAbort));
+      resolve(ok);
+    };
+    const onAbort = () => done(false);
+    const timer = setTimeout(() => done(false), ms);
+    signals.forEach(s => s?.addEventListener('abort', onAbort));
+    if (signals.some(s => s?.aborted)) {
+      done(false);
+      return;
+    }
+    promise.then(() => done(true), () => done(true));
+  });
 }
 
 /**
@@ -61,6 +86,12 @@ export class ExecToolCategory extends BaseToolCategory {
 
   // Shell context for managing different shell types
   public shellContext = new ShellContext();
+
+  // Per-tab command queue (tab -> tail of the queue), so two clients never
+  // type into the same shell at once
+  private tabQueues = new WeakMap<object, Promise<void>>();
+  // Reconnects in progress, shared by every caller on the same tab
+  private reconnects = new WeakMap<object, Promise<boolean>>();
 
   constructor(
     private app: AppService,
@@ -226,28 +257,78 @@ export class ExecToolCategory extends BaseToolCategory {
   }
 
   /**
+   * Whether Tabby is already connecting the tab: the spinner runs during the
+   * SSH handshake, and the new session is set but not open while the shell starts.
+   */
+  private isConnecting(session: BaseTerminalTabComponentWithId): boolean {
+    const tab = session.tab as any;
+    return !!tab.spinnerActive || (!!tab.session && !tab.session.open);
+  }
+
+  /**
    * Reconnect a disconnected connectable tab (SSH, Telnet, Serial) and wait
-   * until its session is open again.
+   * until its session is open again. Callers on the same tab share one attempt.
    * @returns true if the session is open after reconnecting
    */
-  public async reconnectSession(session: BaseTerminalTabComponentWithId, timeoutMs: number): Promise<boolean> {
+  public reconnectSession(session: BaseTerminalTabComponentWithId, timeoutMs: number): Promise<boolean> {
+    const key = session.tab;
+    let pending = this.reconnects.get(key);
+    if (!pending) {
+      pending = this.doReconnect(session, timeoutMs).finally(() => this.reconnects.delete(key));
+      this.reconnects.set(key, pending);
+    }
+    return pending;
+  }
+
+  private async doReconnect(session: BaseTerminalTabComponentWithId, timeoutMs: number): Promise<boolean> {
     const tab = session.tab as any;
-    if (typeof tab.reconnect !== 'function') {
-      return false;
+    const deadline = Date.now() + timeoutMs;
+
+    // reconnect() destroys the current session first, so calling it while
+    // Tabby is connecting (e.g. the user pressed a key) would restart that attempt
+    if (this.isConnecting(session)) {
+      this.logger.info(`Session ${session.id} (${session.tab.title}) is already connecting, waiting`);
+    } else {
+      if (typeof tab.reconnect !== 'function') {
+        return false;
+      }
+      this.logger.info(`Reconnecting session ${session.id} (${session.tab.title})`);
+      // reconnect() resolves once the connection attempt finishes, but it can
+      // also wait on user input (e.g. a password prompt), so cap the wait.
+      const reconnect = Promise.resolve(tab.reconnect()).catch(err => {
+        this.logger.error(`Reconnect failed for session ${session.id}:`, err);
+      });
+      await Promise.race([reconnect, sleep(timeoutMs)]);
     }
 
-    this.logger.info(`Reconnecting session ${session.id} (${session.tab.title})`);
-    // reconnect() resolves once the connection attempt finishes, but it can
-    // also wait on user input (e.g. a password prompt), so cap the wait.
-    const reconnect = Promise.resolve(tab.reconnect()).catch(err => {
-      this.logger.error(`Reconnect failed for session ${session.id}:`, err);
-    });
-    const deadline = Date.now() + timeoutMs;
-    await Promise.race([reconnect, new Promise(resolve => setTimeout(resolve, timeoutMs))]);
     while (!this.isSessionConnected(session) && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await sleep(200);
     }
     return this.isSessionConnected(session);
+  }
+
+  /**
+   * Wait for the tab to be free and take it.
+   * @returns a release function, or null on timeout or cancel
+   */
+  public async acquireTab(
+    session: BaseTerminalTabComponentWithId,
+    waitMs: number,
+    signals: (AbortSignal | undefined)[]
+  ): Promise<(() => void) | null> {
+    const key = session.tab;
+    const previous = this.tabQueues.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>(resolve => (release = resolve));
+    // Later callers wait for both the previous holder and us
+    this.tabQueues.set(key, previous.then(() => mine));
+
+    if (await waitFor(previous, waitMs, signals)) {
+      return release;
+    }
+    // Gave up: let the queue move on as soon as the previous holder is done
+    release();
+    return null;
   }
 
   /**
