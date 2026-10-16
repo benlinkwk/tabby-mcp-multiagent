@@ -1,7 +1,20 @@
 import { Component, HostBinding, OnInit } from '@angular/core';
-import { ConfigService } from 'tabby-core';
+import { ConfigService, ProfilesService } from 'tabby-core';
 import { McpService } from '../services/mcpService';
 import { McpLoggerService } from '../services/mcpLogger.service';
+import { ExecToolCategory } from '../tools/terminal';
+
+/**
+ * A saved profile as shown in the Agent Tabs list
+ */
+interface AgentTabProfile {
+    id?: string;
+    name: string;
+    icon?: string;
+    color?: string;
+    // e.g. the SSH host
+    description: string;
+}
 
 /** @hidden */
 @Component({
@@ -15,6 +28,10 @@ export class McpSettingsTabComponent implements OnInit {
     enableDebugLogging: boolean = false;
     startOnBoot: boolean = true;
     autoReconnect: boolean = false;
+    // Saved profiles by group path, and the names agents may open with open_tab
+    profileGroups: { path: string, profiles: AgentTabProfile[] }[] = [];
+    agentTabProfiles: string[] = [];
+    closeAgentTabsOnDisconnect: boolean = true;
 
     // Pair Programming Mode settings
     pairProgrammingEnabled: boolean = false;
@@ -25,7 +42,9 @@ export class McpSettingsTabComponent implements OnInit {
     constructor(
         public config: ConfigService,
         private mcpService: McpService,
-        private logger: McpLoggerService
+        private logger: McpLoggerService,
+        private profilesService: ProfilesService,
+        private execToolCategory: ExecToolCategory
     ) {
         console.log('McpSettingsTabComponent constructor');
     }
@@ -40,6 +59,8 @@ export class McpSettingsTabComponent implements OnInit {
 
         // Check server status
         this.updateServerStatus();
+
+        this.loadProfiles();
 
         // Log initial state
         console.log('MCP Settings initial state:', {
@@ -94,6 +115,8 @@ export class McpSettingsTabComponent implements OnInit {
                 this.enableDebugLogging = !!this.config.store.mcp.enableDebugLogging;
                 this.startOnBoot = this.config.store.mcp.startOnBoot !== false; // Default to true if not set
                 this.autoReconnect = this.config.store.mcp.autoReconnect === true;
+                this.agentTabProfiles = [...(this.config.store.mcp.openTab?.profiles || [])];
+                this.closeAgentTabsOnDisconnect = this.config.store.mcp.openTab?.closeOnDisconnect !== false;
 
                 // Load Pair Programming Mode settings
                 if (this.config.store.mcp.pairProgrammingMode) {
@@ -221,6 +244,71 @@ export class McpSettingsTabComponent implements OnInit {
             this.logger.info(`Auto reconnect ${this.autoReconnect ? 'enabled' : 'disabled'}`);
         } catch (error) {
             console.error('Error toggling auto reconnect:', error);
+        }
+    }
+
+    /**
+     * Group saved profiles by group path, like Tabby's profile list
+     */
+    private async loadProfiles(): Promise<void> {
+        try {
+            const profiles = await this.profilesService.getProfiles({ includeBuiltin: false });
+            const groups = new Map<string, AgentTabProfile[]>();
+            for (const profile of profiles.filter(p => !p.isTemplate)) {
+                const path = this.execToolCategory.groupPath(profile.group) ?? '';
+                if (!groups.has(path)) {
+                    groups.set(path, []);
+                }
+                groups.get(path)!.push({
+                    id: profile.id,
+                    name: profile.name,
+                    icon: profile.icon ?? undefined,
+                    color: profile.color ?? undefined,
+                    description: this.profilesService.getDescription(profile) ?? '',
+                });
+            }
+            // Ungrouped profiles last
+            this.profileGroups = [...groups.entries()]
+                .sort(([a], [b]) => (a === '') !== (b === '') ? (a === '' ? 1 : -1) : a.localeCompare(b))
+                .map(([path, items]) => ({ path, profiles: items }));
+        } catch (error) {
+            console.error('Error loading profiles:', error);
+        }
+    }
+
+    toggleAgentTabProfile(name: string, event: Event): void {
+        try {
+            const checked = (event.target as HTMLInputElement).checked;
+            this.agentTabProfiles = checked
+                ? [...this.agentTabProfiles.filter(n => n !== name), name]
+                : this.agentTabProfiles.filter(n => n !== name);
+            if (!this.config.store.mcp) {
+                this.config.store.mcp = {};
+            }
+            if (!this.config.store.mcp.openTab) {
+                this.config.store.mcp.openTab = {};
+            }
+            this.config.store.mcp.openTab.profiles = this.agentTabProfiles;
+            this.config.save();
+            this.logger.info(`Agent tab profiles updated: ${this.agentTabProfiles.join(', ') || '(none)'}`);
+        } catch (error) {
+            console.error('Error saving agent tab profiles:', error);
+        }
+    }
+
+    toggleCloseAgentTabsOnDisconnect(): void {
+        try {
+            if (!this.config.store.mcp) {
+                this.config.store.mcp = {};
+            }
+            if (!this.config.store.mcp.openTab) {
+                this.config.store.mcp.openTab = {};
+            }
+            this.config.store.mcp.openTab.closeOnDisconnect = this.closeAgentTabsOnDisconnect;
+            this.config.save();
+            this.logger.info(`Close agent tabs on disconnect ${this.closeAgentTabsOnDisconnect ? 'enabled' : 'disabled'}`);
+        } catch (error) {
+            console.error('Error toggling close agent tabs on disconnect:', error);
         }
     }
 

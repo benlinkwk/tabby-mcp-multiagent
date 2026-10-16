@@ -627,50 +627,19 @@ printf '\\n${marker} %s\\n' "$?"
   getTool() {
     return {
       name: 'exec_command',
-      description: `Executes a shell command in a terminal session and returns the command output, exit code, and shell prompt.
-
-USE CASES:
-- Run shell commands to interact with the system
-- Execute scripts or programs
-- Query system status or configuration
-- Perform file operations
-
-LIMITATIONS:
-- One command per tab; a command from another client waits up to 30s, then returns a busy error
-- Interrupted with Ctrl+C after \`timeout\` seconds (default 600)
-- Commands with very long output (>250 lines) will be truncated
-- Some interactive commands may not work as expected
-- Automatic retry up to 3 times on execution failures
-
-RETURNS:
-{
-  "output": "Command output text (truncated to 250 lines if longer)",
-  "promptShell": "The shell prompt (e.g., user@host:~$)",
-  "exitCode": 0, // Command exit code (0 typically means success)
-  "aborted": false, // Whether the command was aborted
-  "outputId": "unique-id", // ID to use with get_command_output for pagination
-  "message": "" // Optional message about truncation or user feedback
-}
-
-RELATED TOOLS:
-- get_ssh_session_list: Find available terminal sessions
-- get_command_output: Retrieve full output for truncated responses
-
-EXAMPLE USAGE:
-1. List available terminals: get_ssh_session_list()
-2. Execute command: exec_command({ command: "ls -la", tabId: "0" })
-3. If output is truncated, get full output: get_command_output({ outputId: "abc123" })
-
-POSSIBLE ERRORS:
-- "A command is already running. Abort it first." - Use abort_command to stop the current command.
-- "No terminal sessions available" - Open a terminal tab first.
-- "No terminal session found with ID {tabId}" - Use get_ssh_session_list to find valid IDs.`,
+      description: `Run a shell command in a Tabby terminal tab and return its output, exit code and prompt.
+- One command per tab. A command from another client waits up to 30s, then returns a busy error: retry, use another tab, or open_tab.
+- Interrupted with Ctrl+C after \`timeout\` seconds (default 600).
+- Output over 250 lines is truncated; get the rest with get_command_output and the returned outputId.
+- A disconnected tab is reconnected first when Auto Reconnect is on; otherwise an error is returned.`,
       schema: {
-        command: z.string().describe('The shell command to execute. Can be any valid shell command, script, or program that would normally run in a terminal. Examples: "ls -la", "cat /etc/hosts", "ps aux | grep node"'),
+        command: z.string().describe('Shell command to run'),
 
-        commandExplanation: z.string().optional().describe('Explanation of what the command does, used for user confirmation in pair programming mode. Include: 1) What the base command does (e.g., "ls" lists directory contents), 2) What each argument/flag does (e.g., "-r" reverses order), 3) The overall purpose of the command. Example: "The command \'ls -la\' lists all files including hidden ones in long format showing permissions and sizes."'),
+        commandExplanation: z.string().optional().describe('What the command does, shown to the user in pair programming mode'),
 
-        tabId: z.string().optional().describe('The ID of the terminal tab where the command will be executed. If not provided, the currently focused terminal will be used. Get available IDs by calling get_ssh_session_list first. Example: "0" or "1".'),
+        tabId: z.string().optional().describe('Tab id from get_ssh_session_list (default: focused tab)'),
+
+        expectTitle: z.string().optional().describe('Text the tab title must contain, so a wrong tab is refused. Without tabId, the first matching tab is used'),
 
         timeout: z.number().int().min(1).optional().describe('Seconds before the command is interrupted with Ctrl+C (default 600)')
       },
@@ -679,32 +648,17 @@ POSSIBLE ERRORS:
         
         try {
           console.log('Params:', JSON.stringify(params));
-          const { command, tabId, commandExplanation } = params;
+          const { command, tabId, expectTitle, commandExplanation } = params;
           console.log(`Executing command: ${command}, tabId: ${tabId}`);
           if (commandExplanation) {
             console.log(`Command explanation: ${commandExplanation}`);
           }
 
-          // Find all terminal sessions
-          const sessions = this.execToolCategory.findAndSerializeTerminalSessions();
-
-          // If no tabId is provided, use the active tab
-          if (tabId) {
-            session = sessions.find(s => s.id.toString() === tabId);
-            if (!session) {
-              return createErrorResponse(`No terminal session found with ID ${tabId}`);
-            }
-          } else {
-            // Find the active tab
-            session = sessions.find(s => s.tab.hasFocus);
-            if (!session) {
-              // If no active tab, use the first one
-              session = sessions[0];
-              if (!session) {
-                return createErrorResponse('No terminal sessions available');
-              }
-            }
+          const resolved = this.execToolCategory.resolveSession(tabId, expectTitle);
+          if (resolved.error) {
+            return createErrorResponse(resolved.error);
           }
+          session = resolved.session;
 
           this.logger.info(`Using terminal session ${session.id} (${session.tab.title})`);
 
@@ -733,7 +687,7 @@ POSSIBLE ERRORS:
             const detail = busy
               ? ` running "${busy.command.slice(0, 80)}" for ${Math.round((Date.now() - busy.timestamp) / 1000)}s`
               : '';
-            return createErrorResponse(`Tab ${session.id} (${session.tab.title}) is busy${detail} for another client. Retry later or use another tab.`);
+            return createErrorResponse(`Tab ${session.id} (${session.tab.title}) is busy${detail} for another client. Retry later, use another tab, or open_tab.`);
           }
 
           try {

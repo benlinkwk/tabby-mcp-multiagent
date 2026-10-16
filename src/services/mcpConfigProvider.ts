@@ -18,6 +18,12 @@ export class McpConfigProvider extends ConfigProvider {
       enableDebugLogging: true,
       // Reconnect a disconnected SSH/Telnet/Serial tab before exec_command
       autoReconnect: false,
+      // Saved profiles agents may open with open_tab (none by default)
+      openTab: {
+        profiles: [],
+        maxPerClient: 2,
+        closeOnDisconnect: true
+      },
       pairProgrammingMode: {
         enabled: false,
         autoFocusTerminal: true,

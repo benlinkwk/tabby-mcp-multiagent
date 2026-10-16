@@ -171,10 +171,15 @@ For TOML-based configs, map the same SSE URL using your client's supported SSE M
 
 | Tool | Description | Parameters |
 | --- | --- | --- |
-| `get_ssh_session_list` | List available Tabby terminal sessions, including whether each one is `connected` | none |
-| `exec_command` | Execute a shell command in a terminal tab. Returns an error instead of waiting if the session is disconnected or closes mid-command | `command`, `tabId`, `commandExplanation` |
-| `get_terminal_buffer` | Read terminal buffer content | `tabId`, `startLine`, `endLine` |
+| `get_ssh_session_list` | List available Tabby terminal sessions, including whether each one is `connected` and its profile `group` path (e.g. `Adobe Campaign PROD / PROD Asia`). A tab keeps its id while open | none |
+| `exec_command` | Execute a shell command in a terminal tab. One command per tab: another client's command waits up to 30s, then gets a busy error. Interrupted after `timeout` seconds (default 600) | `command`, `tabId`, `expectTitle`, `timeout`, `commandExplanation` |
+| `get_terminal_buffer` | Read terminal buffer content | `tabId`, `startLine`, `endLine`, `expectTitle` |
 | `get_command_output` | Retrieve full/paginated command output | `outputId`, `startLine`, `maxLines` |
+| `list_profiles` | List saved profiles that `open_tab` may open, with their group path | none |
+| `open_tab` | Open a new tab from an allowed saved profile and wait until it connects | `profile`, `title` |
+| `close_tab` | Close a tab opened with `open_tab` | `tabId` |
+
+`expectTitle` makes a call fail instead of running on another tab when the title doesn't contain the given text.
 
 ## Configuration
 
@@ -189,6 +194,11 @@ Default plugin configuration:
     "serverUrl": "http://localhost:3001",
     "enableDebugLogging": true,
     "autoReconnect": false,
+    "openTab": {
+      "profiles": [],
+      "maxPerClient": 2,
+      "closeOnDisconnect": true
+    },
     "pairProgrammingMode": {
       "enabled": true,
       "showConfirmationDialog": true,
@@ -203,6 +213,10 @@ Configure these options in Tabby under **Settings → Plugins → MCP**.
 ### Auto Reconnect
 
 When `autoReconnect` is enabled and `exec_command` targets an SSH, Telnet or Serial tab whose session has closed, the plugin reconnects the tab (same as Tabby's **Reconnect** action, using the saved profile) and waits up to 30 seconds before running the command. If the tab does not reconnect in time, for example because it is waiting for a password, `exec_command` returns an error. When disabled (the default), `exec_command` returns an error for a disconnected tab.
+
+### Agent Tabs
+
+`open_tab` lets each AI client work in its own tab instead of sharing one. It only opens saved profiles ticked under **Agent Tabs**; with none ticked it is disabled. Hosts and credentials always come from the profile, never from the client. New tabs are titled `[AI] <title>`, focus stays on your current tab, each client may open up to `maxPerClient` tabs, and idle tabs are closed when their client disconnects (`closeOnDisconnect`). `close_tab` only closes tabs opened with `open_tab`.
 
 ### Pair Programming Mode
 

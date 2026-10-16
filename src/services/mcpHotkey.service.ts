@@ -43,7 +43,7 @@ export class McpHotkeyService {
       const sessions = this.execToolCategory.findAndSerializeTerminalSessions();
       
       // Find the focused session
-      const focusedSession = sessions.find(s => s.tab.hasFocus);
+      const focusedSession = sessions.find(s => this.execToolCategory.isFocused(s));
       
       if (!focusedSession) {
         this.logger.warn('No focused terminal session found for abort command');

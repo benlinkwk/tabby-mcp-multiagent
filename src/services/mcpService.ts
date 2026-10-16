@@ -117,6 +117,11 @@ export class McpService {
           // Stop tool calls still waiting for this client
           connectionClosed.abort();
           server.close().catch(err => this.logger.error(`Error closing MCP server for sessionId ${sessionId}:`, err));
+          // Close the client's tabs once its waiting tool calls have stopped
+          setTimeout(() => {
+            this.execToolCategory.closeClientTabs(sessionId)
+              .catch(err => this.logger.error(`Error closing tabs for sessionId ${sessionId}:`, err));
+          }, 1000);
           this.logger.info(`SSE connection closed for sessionId ${sessionId}`);
         }
       };

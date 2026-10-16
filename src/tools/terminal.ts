@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { AppService, BaseTabComponent, ConfigService, HostWindowService, SplitTabComponent } from 'tabby-core';
+import { AppService, BaseTabComponent, ConfigService, HostWindowService, PartialProfile, Profile, ProfilesService, SplitTabComponent } from 'tabby-core';
 import { BaseTerminalTabComponent, XTermFrontend } from 'tabby-terminal';
 import { BaseToolCategory } from './base-tool-category';
 import { SerializeAddon } from '@xterm/addon-serialize';
@@ -15,7 +15,10 @@ import {
   SshSessionListTool,
   ExecCommandTool,
   GetTerminalBufferTool,
-  GetCommandOutputTool
+  GetCommandOutputTool,
+  ListProfilesTool,
+  OpenTabTool,
+  CloseTabTool
 } from './terminal/';
 
 /**
@@ -40,6 +43,13 @@ export interface ActiveCommand {
   // MCP session that started the command
   clientId?: string;
 }
+
+/**
+ * A tab found for a tool call, or why none was found
+ */
+export type SessionLookup =
+  | { session: BaseTerminalTabComponentWithId, error?: undefined }
+  | { session?: undefined, error: string };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -93,13 +103,22 @@ export class ExecToolCategory extends BaseToolCategory {
   // Reconnects in progress, shared by every caller on the same tab
   private reconnects = new WeakMap<object, Promise<boolean>>();
 
+  // Stable tab ids: a tab keeps its id while open, so ids don't shift when
+  // other tabs open or close. Ids are never reused.
+  private tabIds = new WeakMap<object, number>();
+  private nextTabId = 0;
+
+  // Tabs opened with open_tab (tab -> MCP session id that opened it)
+  private agentTabs = new Map<BaseTerminalTabComponent<any>, string | undefined>();
+
   constructor(
     private app: AppService,
     logger: McpLoggerService,
     private config: ConfigService,
     private dialogService: DialogService,
     private commandHistoryManager: CommandHistoryManagerService,
-    private runningCommandsManager: RunningCommandsManagerService
+    private runningCommandsManager: RunningCommandsManagerService,
+    private profilesService: ProfilesService
   ) {
     super(logger);
 
@@ -139,6 +158,9 @@ export class ExecToolCategory extends BaseToolCategory {
     this.registerTool(execCommandTool.getTool());
     this.registerTool(getTerminalBufferTool.getTool());
     this.registerTool(getCommandOutputTool.getTool());
+    this.registerTool(new ListProfilesTool(this, this.logger).getTool());
+    this.registerTool(new OpenTabTool(this, this.logger).getTool());
+    this.registerTool(new CloseTabTool(this, this.logger).getTool());
   }
 
   /**
@@ -226,11 +248,10 @@ export class ExecToolCategory extends BaseToolCategory {
    */
   public findAndSerializeTerminalSessions(): BaseTerminalTabComponentWithId[] {
     const sessions: BaseTerminalTabComponentWithId[] = [];
-    let id = 0;
     this.app.tabs.forEach((tab, tabIdx) => {
       if (tab instanceof BaseTerminalTabComponent) {
         sessions.push({
-          id: id++,
+          id: this.idFor(tab),
           tabParent: tab,
           tab: tab as BaseTerminalTabComponent<any>
         });
@@ -238,13 +259,211 @@ export class ExecToolCategory extends BaseToolCategory {
         sessions.push(...tab.getAllTabs()
           .filter(childTab => childTab instanceof BaseTerminalTabComponent && (childTab as BaseTerminalTabComponent<any>).frontend !== undefined)
           .map(childTab => ({
-            id: id++,
+            id: this.idFor(childTab),
             tabParent: tab,
             tab: childTab as BaseTerminalTabComponent<any>
           })));
       }
     });
     return sessions;
+  }
+
+  /**
+   * Whether the tab is the one the user is looking at. tab.hasFocus can stay
+   * true after another tab is selected, so also check the active tab (and the
+   * focused pane of a split tab).
+   */
+  public isFocused(session: BaseTerminalTabComponentWithId): boolean {
+    const parent = session.tabParent;
+    if (this.app.activeTab !== parent) {
+      return false;
+    }
+    return parent instanceof SplitTabComponent ? parent.getFocusedTab() === session.tab : true;
+  }
+
+  private idFor(tab: BaseTabComponent): number {
+    let id = this.tabIds.get(tab);
+    if (id === undefined) {
+      id = this.nextTabId++;
+      this.tabIds.set(tab, id);
+    }
+    return id;
+  }
+
+  /**
+   * Find the tab for a tool call. With expectTitle, refuse a tab whose title
+   * doesn't contain it, so a stale id never runs on the wrong server.
+   * Without tabId, use the first tab matching expectTitle, else the focused tab.
+   */
+  public resolveSession(tabId?: string, expectTitle?: string): SessionLookup {
+    const sessions = this.findAndSerializeTerminalSessions();
+    const titleOf = (s: BaseTerminalTabComponentWithId) => s.tab.customTitle || s.tab.title;
+    const matches = (s: BaseTerminalTabComponentWithId) =>
+      !expectTitle || [s.tab.customTitle, s.tab.title].some(t => t?.includes(expectTitle));
+
+    let session: BaseTerminalTabComponentWithId | undefined;
+    if (tabId) {
+      session = sessions.find(s => s.id.toString() === tabId);
+      if (!session) {
+        return { error: `No terminal session found with ID ${tabId}` };
+      }
+      if (!matches(session)) {
+        return { error: `Tab ${tabId} is "${titleOf(session)}", not "${expectTitle}". Call get_ssh_session_list for current ids.` };
+      }
+    } else if (expectTitle) {
+      session = sessions.find(matches);
+      if (!session) {
+        return { error: `No tab title contains "${expectTitle}"` };
+      }
+    } else {
+      session = sessions.find(s => this.isFocused(s)) || sessions[0];
+      if (!session) {
+        return { error: 'No terminal sessions available' };
+      }
+    }
+    return { session };
+  }
+
+  /**
+   * Profile group path, e.g. "Adobe Campaign PROD / PROD Asia", so a client
+   * can tell environments apart without relying on tab names.
+   */
+  public groupPath(groupId?: string): string | undefined {
+    const groups: { id: string, name: string, parentGroupId?: string }[] = this.config.store.groups || [];
+    const names: string[] = [];
+    const seen = new Set<string>();
+    let group = groups.find(g => g.id === groupId);
+    while (group && !seen.has(group.id)) {
+      seen.add(group.id);
+      names.unshift(group.name);
+      const parentId = group.parentGroupId;
+      group = groups.find(g => g.id === parentId);
+    }
+    return names.length ? names.join(' / ') : undefined;
+  }
+
+  /**
+   * Group path of the profile a tab was opened from (SSH, Telnet, Serial)
+   */
+  public tabGroup(session: BaseTerminalTabComponentWithId): string | undefined {
+    return this.groupPath((session.tab as any).profile?.group);
+  }
+
+  public isAgentTab(session: BaseTerminalTabComponentWithId): boolean {
+    return this.agentTabs.has(session.tab);
+  }
+
+  /**
+   * Profiles agents may open (Settings -> MCP -> Agent Tabs)
+   */
+  public async getAllowedProfiles(): Promise<PartialProfile<Profile>[]> {
+    const allowed: string[] = this.config.store.mcp?.openTab?.profiles || [];
+    if (!allowed.length) {
+      return [];
+    }
+    const profiles = await this.profilesService.getProfiles({ includeBuiltin: false });
+    return profiles.filter(p => !p.isTemplate && allowed.includes(p.name));
+  }
+
+  /**
+   * Open a tab for a saved profile and wait until its session is open.
+   */
+  public async openAgentTab(
+    profileName: string,
+    title: string | undefined,
+    clientId: string | undefined,
+    timeoutMs: number
+  ): Promise<SessionLookup> {
+    const profiles = await this.getAllowedProfiles();
+    const profile = profiles.find(p => p.name === profileName);
+    if (!profile) {
+      const names = profiles.map(p => p.name);
+      return { error: names.length
+        ? `Profile "${profileName}" is not allowed. Allowed: ${names.join(', ')}`
+        : 'No profiles are allowed. Add them in Tabby Settings -> MCP -> Agent Tabs.' };
+    }
+
+    const limit = this.config.store.mcp?.openTab?.maxPerClient ?? 2;
+    const owned = [...this.agentTabs.values()].filter(owner => owner === clientId).length;
+    if (owned >= limit) {
+      return { error: `This client already has ${owned} open tab(s) (limit ${limit}). Close one with close_tab first.` };
+    }
+
+    // Opening a tab selects it, sometimes only after openNewTabForProfile()
+    // resolves; give focus back so the user isn't interrupted
+    const previous = this.app.activeTab;
+    const restoreFocus = () => {
+      if (previous && this.app.tabs.includes(previous) && this.app.activeTab !== previous) {
+        this.app.selectTab(previous);
+      }
+    };
+    const tab = await this.profilesService.openNewTabForProfile(profile) as BaseTerminalTabComponent<any>;
+    restoreFocus();
+    if (!tab) {
+      return { error: `Could not open a tab for profile "${profileName}"` };
+    }
+    tab.customTitle = `[AI] ${title || profileName}`;
+    this.agentTabs.set(tab, clientId);
+    // Forget it when the tab closes, however it is closed
+    tab.destroyed$.subscribe(() => this.agentTabs.delete(tab));
+    this.logger.info(`Opened agent tab "${tab.customTitle}" for client ${clientId}`);
+
+    // The tab only shows up once its frontend is ready
+    const deadline = Date.now() + timeoutMs;
+    let session: BaseTerminalTabComponentWithId | undefined;
+    while (Date.now() < deadline) {
+      session = this.findAndSerializeTerminalSessions().find(s => s.tab === tab);
+      if (session && this.isSessionConnected(session)) {
+        restoreFocus();
+        return { session };
+      }
+      await sleep(200);
+    }
+    restoreFocus();
+    return { error: `Tab${session ? ` ${session.id}` : ''} opened but did not connect within ${timeoutMs / 1000}s. Check it in Tabby (it may be waiting for a password).` };
+  }
+
+  /**
+   * Close a tab opened with open_tab.
+   */
+  public async closeAgentTab(session: BaseTerminalTabComponentWithId, clientId: string | undefined): Promise<string | null> {
+    if (!this.agentTabs.has(session.tab)) {
+      return `Tab ${session.id} was not opened with open_tab; only those can be closed.`;
+    }
+    const running = this.getActiveCommand(session.id);
+    if (running && running.clientId !== clientId) {
+      return `Tab ${session.id} is running another client's command.`;
+    }
+    if (running) {
+      this.abortCommand(session.id);
+    }
+    await this.closeTab(session);
+    return null;
+  }
+
+  /**
+   * Close idle tabs a client opened, once its connection is gone.
+   */
+  public async closeClientTabs(clientId: string): Promise<void> {
+    if (this.config.store.mcp?.openTab?.closeOnDisconnect === false) {
+      return;
+    }
+    for (const session of this.findAndSerializeTerminalSessions()) {
+      if (this.agentTabs.has(session.tab) && this.agentTabs.get(session.tab) === clientId && !this.getActiveCommand(session.id)) {
+        this.logger.info(`Closing agent tab ${session.id} of disconnected client ${clientId}`);
+        await this.closeTab(session);
+      }
+    }
+  }
+
+  private async closeTab(session: BaseTerminalTabComponentWithId): Promise<void> {
+    const parent = session.tabParent;
+    if (parent instanceof SplitTabComponent && parent.getAllTabs().length > 1) {
+      // Only close our pane if the user split the tab
+      session.tab.destroy();
+    } else {
+      await this.app.closeTab(parent, false);
+    }
   }
 
   /**

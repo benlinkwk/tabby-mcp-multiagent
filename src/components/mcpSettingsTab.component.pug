@@ -7,28 +7,28 @@
   .form-group
     label Server URL
     .d-flex
-      input.form-control.mr-2(
+      input.form-control.me-2(
         type='text',
         [(ngModel)]='serverUrl',
       )
       button.btn.btn-secondary(
         (click)='saveServerUrl()',
       )
-        i.fas.fa-save.mr-1
+        i.fas.fa-save.me-1
         span Save
     .text-muted The URL of the MCP server to connect to
 
   .form-group
     label Port
     .d-flex
-      input.form-control.mr-2(
+      input.form-control.me-2(
         type='number',
         [(ngModel)]='port',
       )
       button.btn.btn-secondary(
         (click)='savePort()',
       )
-        i.fas.fa-save.mr-1
+        i.fas.fa-save.me-1
         span Save
     .text-muted The port number for the MCP server
 
@@ -38,10 +38,10 @@
       toggle(
         [(ngModel)]='startOnBoot',
       )
-      button.btn.btn-secondary.ml-2(
+      button.btn.btn-secondary.ms-2(
         (click)='toggleStartOnBoot()',
       )
-        i.fas.fa-save.mr-1
+        i.fas.fa-save.me-1
         span Save
     .text-muted Automatically start the MCP server when Tabby starts
 
@@ -51,27 +51,60 @@
       toggle(
         [(ngModel)]='autoReconnect',
       )
-      button.btn.btn-secondary.ml-2(
+      button.btn.btn-secondary.ms-2(
         (click)='toggleAutoReconnect()',
       )
-        i.fas.fa-save.mr-1
+        i.fas.fa-save.me-1
         span Save
     .text-muted Reconnect a disconnected SSH/Telnet/Serial tab before running exec_command. When off, exec_command returns an error instead.
 
   .form-group
+    label Agent Tabs
+    .text-muted.mb-2 Saved profiles an AI client may open in a new tab with open_tab. Saved when ticked; none ticked disables open_tab.
+    .mb-2(*ngFor='let group of profileGroups')
+      .text-muted.mb-1
+        i.far.fa-folder.me-1
+        span {{ group.path || 'Ungrouped' }}
+      .form-check.ms-3(*ngFor='let profile of group.profiles')
+        input.form-check-input(
+          type='checkbox',
+          [id]='"mcp-agent-tab-" + profile.id',
+          [checked]='agentTabProfiles.includes(profile.name)',
+          (change)='toggleAgentTabProfile(profile.name, $event)',
+        )
+        label.form-check-label.d-flex.align-items-center([for]='"mcp-agent-tab-" + profile.id')
+          profile-icon.me-2([icon]='profile.icon', [color]='profile.color')
+          span {{ profile.name }}
+          span.text-muted.ms-2 {{ profile.description }}
+    .text-muted(*ngIf='!profileGroups.length') No saved profiles
+
+  .form-group
+    label Close Agent Tabs on Disconnect
+    .d-flex
+      toggle(
+        [(ngModel)]='closeAgentTabsOnDisconnect',
+      )
+      button.btn.btn-secondary.ms-2(
+        (click)='toggleCloseAgentTabsOnDisconnect()',
+      )
+        i.fas.fa-save.me-1
+        span Save
+    .text-muted Close idle tabs an AI client opened when that client disconnects
+
+  .form-group
     label Server Control
     .d-flex
-      button.btn.btn-primary.mr-2(
+      button.btn.btn-primary.me-2(
         *ngIf='!isServerRunning',
         (click)='startServer()',
       )
-        i.fas.fa-play.mr-2
+        i.fas.fa-play.me-2
         span Start Server
       button.btn.btn-danger(
         *ngIf='isServerRunning',
         (click)='stopServer()',
       )
-        i.fas.fa-stop.mr-2
+        i.fas.fa-stop.me-2
         span Stop Server
     .text-muted.mt-2(*ngIf='isServerRunning') Server is currently running
     .text-muted.mt-2(*ngIf='!isServerRunning') Server is currently stopped
@@ -82,10 +115,10 @@
       toggle(
         [(ngModel)]='enableDebugLogging',
       )
-      button.btn.btn-secondary.ml-2(
+      button.btn.btn-secondary.ms-2(
         (click)='toggleDebugLogging()',
       )
-        i.fas.fa-save.mr-1
+        i.fas.fa-save.me-1
         span Save
     .text-muted Enable detailed logging for MCP operations
 
@@ -97,10 +130,10 @@
       toggle(
         [(ngModel)]='pairProgrammingEnabled',
       )
-      button.btn.btn-secondary.ml-2(
+      button.btn.btn-secondary.ms-2(
         (click)='togglePairProgrammingMode()',
       )
-        i.fas.fa-save.mr-1
+        i.fas.fa-save.me-1
         span Save
     .text-muted Enable collaborative features for pair programming with AI
 
@@ -110,10 +143,10 @@
       toggle(
         [(ngModel)]='autoFocusTerminal',
       )
-      button.btn.btn-secondary.ml-2(
+      button.btn.btn-secondary.ms-2(
         (click)='toggleAutoFocusTerminal()',
       )
-        i.fas.fa-save.mr-1
+        i.fas.fa-save.me-1
         span Save
     .text-muted Automatically focus the terminal window when executing commands
 
@@ -123,10 +156,10 @@
       toggle(
         [(ngModel)]='showConfirmationDialog',
       )
-      button.btn.btn-secondary.ml-2(
+      button.btn.btn-secondary.ms-2(
         (click)='toggleShowConfirmationDialog()',
       )
-        i.fas.fa-save.mr-1
+        i.fas.fa-save.me-1
         span Save
     .text-muted Show a confirmation dialog before executing commands
 
@@ -136,9 +169,9 @@
       toggle(
         [(ngModel)]='showResultDialog',
       )
-      button.btn.btn-secondary.ml-2(
+      button.btn.btn-secondary.ms-2(
         (click)='toggleShowResultDialog()',
       )
-        i.fas.fa-save.mr-1
+        i.fas.fa-save.me-1
         span Save
     .text-muted Show a dialog with command results after execution
