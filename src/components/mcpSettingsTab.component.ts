@@ -25,6 +25,7 @@ export class McpSettingsTabComponent implements OnInit {
     isServerRunning = false;
     serverUrl: string = 'http://localhost:3001';
     port: number = 3001;
+    listenHost: string = '127.0.0.1';
     enableDebugLogging: boolean = false;
     startOnBoot: boolean = true;
     autoReconnect: boolean = false;
@@ -81,6 +82,7 @@ export class McpSettingsTabComponent implements OnInit {
                     startOnBoot: true,
                     enabled: true,
                     port: 3001,
+                    listenHost: '127.0.0.1',
                     serverUrl: 'http://localhost:3001',
                     enableDebugLogging: false,
                     pairProgrammingMode: {
@@ -112,6 +114,7 @@ export class McpSettingsTabComponent implements OnInit {
             if (this.config.store.mcp) {
                 this.serverUrl = this.config.store.mcp.serverUrl || 'http://localhost:3001';
                 this.port = this.config.store.mcp.port || 3001;
+                this.listenHost = this.config.store.mcp.listenHost || '127.0.0.1';
                 this.enableDebugLogging = !!this.config.store.mcp.enableDebugLogging;
                 this.startOnBoot = this.config.store.mcp.startOnBoot !== false; // Default to true if not set
                 this.autoReconnect = this.config.store.mcp.autoReconnect === true;
@@ -172,10 +175,24 @@ export class McpSettingsTabComponent implements OnInit {
         }
     }
 
+    saveListenHost(): void {
+        console.log(`Saving listen host: ${this.listenHost}`);
+        try {
+            if (!this.config.store.mcp) {
+                this.config.store.mcp = {};
+            }
+            this.config.store.mcp.listenHost = this.listenHost;
+            this.config.save();
+            this.logger.info(`Listen host updated to: ${this.listenHost}`);
+        } catch (error) {
+            console.error('Error saving listen host:', error);
+        }
+    }
+
     async startServer(): Promise<void> {
         console.log('Starting MCP server');
         try {
-            await this.mcpService.startServer(this.port);
+            await this.mcpService.startServer(this.port, this.listenHost);
             this.updateServerStatus();
             this.logger.info('MCP server started successfully');
         } catch (error) {

@@ -191,6 +191,7 @@ Default plugin configuration:
     "enabled": true,
     "startOnBoot": true,
     "port": 3001,
+    "listenHost": "127.0.0.1",
     "serverUrl": "http://localhost:3001",
     "enableDebugLogging": true,
     "autoReconnect": false,
@@ -209,6 +210,11 @@ Default plugin configuration:
 ```
 
 Configure these options in Tabby under **Settings → Plugins → MCP**.
+
+To accept connections from other machines or environments such as WSL, set
+`listenHost` to `0.0.0.0` in the MCP settings. This makes the server reachable
+over the network; use an address reachable from your MCP client in its server
+URL and apply any needed firewall restrictions.
 
 ### Auto Reconnect
 
